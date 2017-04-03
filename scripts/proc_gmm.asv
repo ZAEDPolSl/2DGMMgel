@@ -1,0 +1,269 @@
+function [gmm,init] = proc_gmm(data,x,y,opts)
+% Modeling 2D gel images with mixture of 2D Gaussian functions by modified
+% EM algorithm. Algorihtm is composed of dividing image into smaller
+% segments, filtering and normalization of segments images, fitting
+% Gaussian mixture model to each segment and model post-processing.
+%
+% Input:
+% data - 2D gel image [mxn]
+% x - x-axis labels [mx1]
+% y - y-axis labels [1xn]
+% opts - structure with algorithm parameters
+% 
+% Output:
+% gmm - structure with estimated model parameters and statistics
+% gmm_proc - post-processed model
+% Author: Michal.Marczyk@polsl.pl
+
+%check arguments
+if nargin < 4; opts = default_gmm_opts(); end
+if nargin == 3; error('Label specified for only one axis.'); end
+if nargin < 2
+    x = 1:size(data,1);
+    y = 1:size(data,2);
+end
+if nargin < 1; error('Insufficient number of arguments.'); end
+data = uint8(data);
+
+%initialize parallel computing capabilities
+if opts.parallel
+    if isempty(gcp('nocreate')); parpool; end
+else
+    if ~isempty(gcp('nocreate')); delete(gcp('nocreate')); end
+end
+
+%step0 - perform image processing if global method is on
+if strcmp(opts.proc_type,'global')
+    if(opts.show); disp('Step 0. Glob.'); end
+    data = 255-proc_seg(255-data,opts);
+end
+    
+
+%step1 - find segments
+if opts.seg
+    if(opts.show); disp('Step 1. Divide image into segments.'); end
+    segments = find_segm(x,y,data,opts.show);
+    n_seg = length(segments);
+else
+    segments(1).x = x;
+    segments(1).y = y;
+    segments(1).data = data;
+    n_seg = 1;
+end
+
+%step2 - process and model each segment
+if(opts.show)
+    disp([num2str(n_seg) ' final segments found.'])
+    disp('Step 2. Spot detection and Gaussian mixture modeling.')
+end
+gmm_seg = cell(1,n_seg);    %segments models
+init_seg = gmm_seg;         %segments models IC
+scale = zeros(1,n_seg); %scale for alpha parameters
+parfor a=1:n_seg
+    opts_tmp = opts;
+    opts_tmp.show = false;
+    
+    %separate data for segment
+    x_seg = segments(a).x;
+    y_seg = segments(a).y;
+    data_seg = double(255-segments(a).data);
+    
+    if strcmp(opts_tmp.proc_type,'local')
+        %remove background and filter image noise
+        data_seg = proc_seg(data_seg,opts_tmp);
+    end
+    
+    %crop segment
+    [x_seg,y_seg,data_seg] = auto_crop2(x_seg,y_seg,data_seg);
+        
+    %check if there is an empty segment
+    if sum(data_seg(:))==0
+        scale(a) = 0;
+        continue
+    end
+    
+    %prepare data for modeling
+    [coord,ints] = prep_data(data_seg,x_seg,y_seg);
+        
+    %find initial conditions
+    init_all.alpha = []; init_all.center = [];
+    init_all.covar = []; init_all.KS = 0;
+    if strcmp(opts_tmp.init_type,'watershed')
+        init_all = watershed_init(data_seg,x_seg,y_seg,opts_tmp);
+        
+        %check if there are too close starting points and merge them
+        del = 1; min_dist = 1;
+        dist_tmp = squareform(pdist(init_all.center)).*(diag(nan(1,init_all.KS))+1);
+        while sum(del)
+            [ind1,ind2] = find(dist_tmp<min_dist);
+            del = false(1,init_all.KS);
+            if ~isempty(ind1)
+                for b=1:length(ind1)
+                    if init_all.alpha(ind1(b)) < init_all.alpha(ind2(b))
+                        del(ind1(b)) = true;
+                    else
+                        del(ind2(b)) = true;
+                    end
+
+                end
+                init_all.alpha(del) = [];init_all.center(del,:) = []; init_all.covar(:,:,del) = []; init_all.KS = length(init_all.alpha);
+                init_all.alpha = init_all.alpha/sum(init_all.alpha);
+
+                dist_tmp(del,:) = []; dist_tmp(:,del) = [];                   
+            end
+            if init_all.KS > 50     %check if enough
+                min_dist = min_dist + 1;
+                del  = 1;
+            end
+        end
+    elseif strcmp(opts_tmp.init_type,'external')
+        %define spots coordinates based on external information
+        del = (opts_tmp.init_spots(:,1)<=x_seg(1) | opts_tmp.init_spots(:,1)>=x_seg(end)) |...
+            (opts_tmp.init_spots(:,2)<=y_seg(1) | opts_tmp.init_spots(:,2)>=y_seg(end));    
+        init_all.center = opts_tmp.init_spots(~del,:);
+        init_all.KS = size(init_all.center,1);
+        init_all.covar = repmat([1,0;0,1],1,1,init_all.KS);
+        init_all.alpha = zeros(1,init_all.KS);
+        for b = 1:init_all.KS
+            ind1_tmp = x_seg == init_all.center(b,1);
+            ind2_tmp = y_seg == init_all.center(b,2);
+            init_all.alpha(b) = data_seg(ind1_tmp,ind2_tmp);
+        end
+        del = init_all.alpha == 0;
+        if sum(del)
+            init_all.center(del,:) = [];
+            init_all.KS = size(init_all.center,1);
+            init_all.covar(:,:,del) = [];
+            init_all.alpha(del) = [];
+        end
+        init_all.alpha = init_all.alpha/sum(init_all.alpha);      
+    end
+    if init_all.KS>0
+        init_seg{a} = init_all;
+        
+        %add additional background component
+        init_all.center(end+1,:) = [mean(x_seg),mean(y_seg)];
+        init_all.covar(:,:,end+1) = [(range(x_seg)/6)^2,0;0,(range(y_seg)/6)^2];
+        init_all.alpha(end+1) = mean(init_all.alpha);
+        init_all.alpha = init_all.alpha/sum(init_all.alpha);
+        init_all.KS = init_all.KS+1;
+
+        %build segment model with alpha filtering
+        opts_tmp.thr_alpha = 1e-10/init_all.KS; 
+        del = ints==0;  %remove zero intensities to increase speed
+        gmm_tmp = EM_iter(coord(~del,:),ints(~del),init_all,opts_tmp);
+        
+        %remove additional background component if necessary
+        tmp = zeros(1,gmm_tmp.KS);
+        for b=1:gmm_tmp.KS
+            tmp(b) = norm(gmm_tmp.covar(:,:,b));
+        end
+        [~,del] = max(tmp);
+        if gmm_tmp.KS > 10 %Tukey method
+            if tmp(del) < quantile(tmp,.75) + 3*iqr(tmp) 
+                del = [];
+            end
+        elseif gmm_tmp.KS > 2  %Dixon method
+            [~,ind] = Dixon_test(tmp,0.05);
+            del = find(ind);
+        else
+            del = [];
+        end
+        if del      %remove extra component
+            gmm_tmp.center(del,:) = [];
+            gmm_tmp.covar(:,:,del) = [];
+            gmm_tmp.alpha(del) = [];
+            gmm_tmp.alpha = gmm_tmp.alpha/sum(gmm_tmp.alpha);
+            gmm_tmp.KS = gmm_tmp.KS-1;
+        end
+            
+        gmm_seg{a} = gmm_tmp;
+        scale(a) = plot_gmm(x_seg,y_seg,uint8(255-data_seg),gmm_seg{a},opts_tmp);
+    else
+        scale(a) = 0;
+    end
+end
+
+%step3 - aggregate results
+if(opts.show); disp('Step 3. Aggregate results of segments modeling.'); end
+
+%find and remove empty segments
+del = scale==0; 
+if sum(del)
+    init_seg(del) = [];
+    gmm_seg(del) = []; 
+    scale(del) = []; 
+    n_seg = length(scale);
+end
+KS = 0;
+for a=1:n_seg; KS = KS + gmm_seg{a}.KS; end
+gmm.alpha = zeros(1,KS);
+gmm.center = zeros(KS,2);
+gmm.covar = zeros(2,2,KS);
+gmm.KS = KS;
+KS2 = 0;
+for a=1:n_seg; KS2 = KS2 + init_seg{a}.KS; end
+init.alpha = zeros(1,KS2);
+init.center = zeros(KS2,2);
+init.covar = zeros(2,2,KS2);
+init.KS = KS2;
+count1 = 1; count2 = 1;
+for a=1:n_seg
+    tmp = count1:count1+init_seg{a}.KS-1;
+    init.alpha(tmp) = scale(a)*init_seg{a}.alpha;
+    init.center(tmp,:) = init_seg{a}.center;
+    init.covar(:,:,tmp) = init_seg{a}.covar;
+    count1 = count1 + init_seg{a}.KS;
+    
+    tmp2 = count2:count2+gmm_seg{a}.KS-1;
+    gmm.alpha(tmp2) = scale(a)*gmm_seg{a}.alpha;
+    gmm.center(tmp2,:) = gmm_seg{a}.center;
+    gmm.covar(:,:,tmp2) = gmm_seg{a}.covar;
+    count2 = count2 + gmm_seg{a}.KS;
+end
+    
+%step4 - post-process model
+if opts.show; disp('Step 4. Post-processing of model components.'); end
+if opts.post
+    par0 = zeros(1,gmm.KS);
+    for a=1:gmm.KS
+        [~,ind1] = min(abs(x-gmm.center(a,1)));
+        [~,ind2] = min(abs(y-gmm.center(a,2)));
+        par0(a) = log(double(255-data(ind1,ind2))+1);
+    end
+    del0 = par0 < quantile(par0,0.25) - opts.whisker*iqr(par0);
+    par1 = log(gmm.alpha);
+    del1 = par1 < quantile(par1,0.25) - opts.whisker*iqr(par1);
+
+    par2 = zeros(size(par1));
+    for a=1:gmm.KS
+        par2(a) = log(norm(gmm.covar(:,:,a)));
+    end
+    del2 = par2 > quantile(par2,0.75) + opts.whisker*iqr(par2);
+
+    gmm.alpha(del0|del1|del2) = [];
+    gmm.center(del0|del1|del2,:) = [];
+    gmm.covar(:,:,del0|del1|del2) = [];
+    gmm.KS = length(gmm.alpha);
+end
+
+if(opts.show)
+    
+    figure; subplot(1,2,1); hold on; box on;
+    hist(par1,round(sqrt(gmm.KS)))
+    if sum(del1); plot([max(par1(del1)),max(par1(del1))],ylim,'r'); end
+    xlabel('Log(alpha)'); ylabel('No. of components')
+    title([num2str(sum(del1)) ' components removed.'])
+    subplot(1,2,2); boxplot(par1,'whisker',1.5)
+    ylabel('Log(alpha)'); set(gca,'XTickLabel',{' '})
+    
+    figure; subplot(1,2,1); hold on; box on;
+    hist(par2,round(sqrt(gmm.KS)))
+    if sum(del2); plot([min(par2(del2)),min(par2(del2))],ylim,'r'); end
+    title([num2str(sum(del2)) ' components removed.'])
+    xlabel('||Covariance||'); ylabel('No. of components')
+    subplot(1,2,2); boxplot(par2,'whisker',1.5)
+    ylabel('||Covariance||'); set(gca,'XTickLabel',{' '})
+    
+    plot_gmm(x,y,data,gmm,opts);
+end
